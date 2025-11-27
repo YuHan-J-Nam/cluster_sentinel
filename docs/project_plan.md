@@ -253,3 +253,14 @@ This configuration keeps the Master and Dashboard on your local machine, allowin
 - [x] Run `scancel <job_id>` to kill the Agent.
 - [x] Verify: Does the Agent disappear from the Dashboard within ~5-7 seconds?
 
+### Refinement: Enhanced Client Identification and Display
+
+**Issue:** Initially, client identification on the dashboard was limited to a hashed integer, which did not provide sufficient detail.
+
+**Fix: Full Address and Slot Index Display**
+**Implementation:** `master_server.py` was modified to store and display the full client address tuple (IP and Port) along with its assigned slot index in shared memory and on the web dashboard.
+*   **Shared Memory Format:** Changed from `iff` (int, float, float) to `i64sff` (1-based slot ID, 64-byte string for address tuple, float CPU, float RAM).
+*   **Slot Assignment:** The `slot_index + 1` value is stored in the shared memory to serve as a 1-based client ID, avoiding conflicts with `0` (which signifies an empty slot) and making the ID directly visible on the dashboard.
+*   **Dashboard Display:** The dashboard now retrieves and displays the 1-based `slot_id` and the decoded `(IP, Port)` string for each connected client, providing clearer identification.
+
+

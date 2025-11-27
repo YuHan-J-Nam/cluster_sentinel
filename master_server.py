@@ -10,15 +10,15 @@ from multiprocessing import shared_memory, Lock
 
 # --- Configuration ---
 # Defaults
-DEFAULT_COLLECTOR_HOST = '0.0.0.0' 
+DEFAULT_COLLECTOR_HOST = '0.0.0.0'
 DEFAULT_COLLECTOR_PORT = 13579
 DASHBOARD_HOST = '127.0.0.1'
 DASHBOARD_PORT = 8080
 
 SHARED_MEM_NAME = 'cluster_sentinel_shm'
 MAX_CLIENTS = 10
-# client_id (int), cpu (float), ram (float)
-SHARED_MEM_FORMAT = 'iff'
+# slot_id (int), address (string 64 bytes), cpu (float), ram (float)
+SHARED_MEM_FORMAT = 'i64sff'
 PACKED_DATA_SIZE = struct.calcsize(SHARED_MEM_FORMAT)
 SHARED_MEM_SIZE = PACKED_DATA_SIZE * MAX_CLIENTS
 
@@ -29,15 +29,18 @@ def find_slot(shm):
     """Finds an empty slot in shared memory."""
     for i in range(MAX_CLIENTS):
         offset = i * PACKED_DATA_SIZE
-        client_id, _, _ = struct.unpack(SHARED_MEM_FORMAT, shm.buf[offset:offset + PACKED_DATA_SIZE])
-        if client_id == 0:
+        slot_id, _, _, _ = struct.unpack(SHARED_MEM_FORMAT, shm.buf[offset:offset + PACKED_DATA_SIZE])
+        if slot_id == 0:
             return i
     return None
 
 def handle_client(conn, addr, shm, lock):
     """Handles a single agent connection."""
     print(f"[Collector] Connected by {addr}")
-    client_id = hash(addr) % 100000
+    # Prepare address string for shared memory
+    addr_str = str(addr)
+    addr_bytes = addr_str.encode('utf-8')
+
     slot_index = None
     try:
         with lock:
@@ -66,11 +69,12 @@ def handle_client(conn, addr, shm, lock):
                 ram = stats.get('ram', 0.0)
 
                 with lock:
-                    packed_data = struct.pack(SHARED_MEM_FORMAT, client_id, cpu, ram)
+                    # slot_index + 1 = Active ID (to avoid 0), addr_bytes, cpu, ram
+                    packed_data = struct.pack(SHARED_MEM_FORMAT, slot_index + 1, addr_bytes, cpu, ram)
                     shm.buf[offset:offset + PACKED_DATA_SIZE] = packed_data
 
             except socket.timeout:
-                print(f"[Collector] Client {addr} timed out.")
+                print(f"[Collector] Client {slot_index+1} at {addr} timed out.")
                 break
             except (pickle.UnpicklingError, EOFError):
                 print(f"[Collector] Could not decode data from {addr}. Raw: {data}")
@@ -84,7 +88,8 @@ def handle_client(conn, addr, shm, lock):
         if slot_index is not None:
             with lock:
                 offset = slot_index * PACKED_DATA_SIZE
-                clear_data = struct.pack(SHARED_MEM_FORMAT, 0, 0.0, 0.0)
+                # 0 = Inactive
+                clear_data = struct.pack(SHARED_MEM_FORMAT, 0, b'', 0.0, 0.0)
                 shm.buf[offset:offset + PACKED_DATA_SIZE] = clear_data
             print(f"[Collector] Cleared slot {slot_index}")
 
@@ -134,12 +139,14 @@ def dashboard_process_target(shm_name, lock):
                     for i in range(MAX_CLIENTS):
                         offset = i * PACKED_DATA_SIZE
                         packed_data = shm.buf[offset:offset + PACKED_DATA_SIZE]
-                        client_id, cpu, ram = struct.unpack(SHARED_MEM_FORMAT, packed_data)
+                        slot_id, addr_bytes, cpu, ram = struct.unpack(SHARED_MEM_FORMAT, packed_data)
 
-                        if client_id != 0: # If the slot is active
+                        if slot_id != 0: # If the slot is active
+                            # Decode bytes to string and strip null padding
+                            client_addr = addr_bytes.decode('utf-8').strip('\x00')
                             clients_html += f"""
                             <div class="metric">
-                                <h2>CPU Usage: {cpu:.2f}% (Client: {client_id})</h2>
+                                <h2>CPU Usage: {cpu:.2f}% (Client {slot_id}: {client_addr})</h2>
                                 <div class="bar-container">
                                     <div class="bar cpu-bar" style="width: {cpu}%;">{cpu:.2f}%</div>
                                 </div>
@@ -220,7 +227,7 @@ if __name__ == "__main__":
 
         # Initialize shared memory with zeros
         with lock:
-            initial_data = struct.pack(SHARED_MEM_FORMAT, 0, 0.0, 0.0)
+            initial_data = struct.pack(SHARED_MEM_FORMAT, 0, b'', 0.0, 0.0)
             for i in range(MAX_CLIENTS):
                 offset = i * PACKED_DATA_SIZE
                 shm.buf[offset:offset + PACKED_DATA_SIZE] = initial_data
