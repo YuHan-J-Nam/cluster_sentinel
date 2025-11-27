@@ -3,7 +3,7 @@ import socket
 import struct
 import os
 import sys
-sys.path.append("./circArea")
+sys.path.append("../circArea")
 from higherDimension import doCalculation
 
 HOST, PORT = "0.0.0.0", 14230
