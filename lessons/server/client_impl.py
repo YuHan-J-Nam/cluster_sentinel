@@ -31,5 +31,7 @@ try:
 			s.sendall(data)
 		elif cmd == b"END":
 			raise "Finishing..."
+		else:
+			raise "Finishing..."
 except:
 	s.close()
