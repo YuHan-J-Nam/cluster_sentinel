@@ -115,4 +115,16 @@ This document details the step-by-step development of "The Cluster Sentinel", a 
     - If no data is received for 5 seconds (implying the agent is dead or stuck), the server raises a `socket.timeout` exception.
 - **Result:** The exception handler catches the timeout, breaks the loop, and triggers the `finally` block. This block clears the client's slot in Shared Memory (`client_id = 0`), causing the Dashboard to automatically remove the dead entry on its next refresh.
 
+## Phase 7: Testing & Deployment Utilities
+
+**Goal:** Create independent testing utilities to verify Slurm job submission and network bridging without relying on the full Agent/Master complexity.
+
+### Step 7.1: The Dummy Task
+- **Implementation:** Created `utils/dummy_task.py` and `utils/run_dummy_task.slurm`.
+- **Purpose:** A minimal script that simulates work (logging time and sleeping) to verify that `sbatch` jobs are running correctly on compute nodes and generating output, independent of network connectivity.
+
+### Step 7.2: Enhanced Port Bridge
+- **Implementation:** Updated `port_forward.py` to include a `--host` argument.
+- **Reasoning:** Previously hardcoded to `0.0.0.0`, explicitly allowing the bind address to be configured provides greater flexibility for testing on different network interfaces (e.g., binding only to a specific VPN IP or localhost for secure testing).
+
 

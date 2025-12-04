@@ -253,6 +253,12 @@ This configuration keeps the Master and Dashboard on your local machine, allowin
 - [x] Run `scancel <job_id>` to kill the Agent.
 - [x] Verify: Does the Agent disappear from the Dashboard within ~5-7 seconds?
 
+### Refinement: Testing Utilities (Dec 4, 2025)
+
+To isolate deployment issues from application logic, distinct testing tools were added:
+*   **`utils/dummy_task.py` & `utils/run_dummy_task.slurm`:** Simple scripts to verify Slurm job execution and output logging without network dependencies.
+*   **`port_forward.py` Update:** Added a `--host` argument to the bridge script, allowing the user to specify the bind address (defaulting to `0.0.0.0`) for more flexible network configurations.
+
 ### Refinement: Enhanced Client Identification and Display
 
 **Issue:** Initially, client identification on the dashboard was limited to a hashed integer, which did not provide sufficient detail.
