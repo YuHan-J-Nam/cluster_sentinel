@@ -6,6 +6,10 @@ import multiprocessing
 import struct
 import time
 import threading
+import queue
+import sys
+import select
+import uuid
 from multiprocessing import shared_memory, Lock
 
 # --- Configuration ---
@@ -34,7 +38,7 @@ def find_slot(shm):
             return i
     return None
 
-def handle_client(conn, addr, shm, lock):
+def handle_client(conn, addr, shm, lock, client_queues):
     """Handles a single agent connection."""
     print(f"[Collector] Connected by {addr}")
     # Prepare address string for shared memory
@@ -45,6 +49,13 @@ def handle_client(conn, addr, shm, lock):
     try:
         with lock:
             slot_index = find_slot(shm)
+            if slot_index is not None:
+                # IMMEDIATELY reserve the slot so others don't take it
+                # slot_index + 1 = Active ID
+                print(f"[Collector] Reserving slot {slot_index} for {addr}")
+                offset = slot_index * PACKED_DATA_SIZE
+                packed_data = struct.pack(SHARED_MEM_FORMAT, slot_index + 1, addr_bytes, 0.0, 0.0)
+                shm.buf[offset:offset + PACKED_DATA_SIZE] = packed_data
 
         if slot_index is None:
             print("[Collector] No available slots for new client.")
@@ -52,32 +63,63 @@ def handle_client(conn, addr, shm, lock):
 
         print(f"[Collector] Client {addr} assigned to slot {slot_index}")
         offset = slot_index * PACKED_DATA_SIZE
-
-        # Set a timeout. If no data received in 5 seconds, assume dead.
-        conn.settimeout(5.0)
+        
+        # Get the queue for this slot
+        my_queue = client_queues[slot_index]
 
         while True:
-            try:
+            # Select loop to handle both socket and queue
+            readable, _, _ = select.select([conn], [], [], 0.1)
+
+            # 1. Handle Incoming Data from Agent
+            if conn in readable:
                 data = conn.recv(4096)
                 if not data:
                     break
 
-                stats = pickle.loads(data)
-                print(f"[Collector] Received from {addr}: {stats}")
+                try:
+                    message = pickle.loads(data)
+                    msg_type = message.get('type')
+                    
+                    if msg_type == 'HEARTBEAT':
+                        stats = message.get('payload', {})
+                        cpu = stats.get('cpu', 0.0)
+                        ram = stats.get('ram', 0.0)
 
-                cpu = stats.get('cpu', 0.0)
-                ram = stats.get('ram', 0.0)
+                        with lock:
+                            # Update existing slot
+                            try:
+                                packed_data = struct.pack(SHARED_MEM_FORMAT, slot_index + 1, addr_bytes, cpu, ram)
+                                shm.buf[offset:offset + PACKED_DATA_SIZE] = packed_data
+                                # print(f"[Collector] Updated heartbeat for slot {slot_index}") # Debug
+                            except Exception as pack_err:
+                                print(f"[Collector] Error packing data for slot {slot_index}: {pack_err}")
+                    
+                    elif msg_type == 'TASK_RESULT':
+                        payload = message.get('payload', {})
+                        tid = payload.get('task_id')
+                        stream = payload.get('stream')
+                        data_str = payload.get('data')
+                        print(f"\n[Client {slot_index}][Task {tid}][{stream}] {data_str}")
+                        
+                    elif msg_type == 'TASK_STATUS':
+                         print(f"\n[Client {slot_index}] Status: {message['payload']}")
+                    
+                    elif msg_type is None and isinstance(message, dict) and 'cpu' in message:
+                         # Legacy Agent Detection
+                         print(f"[Collector] WARNING: Client {addr} is running an old version of agent.py! Please update it.")
 
-                with lock:
-                    # slot_index + 1 = Active ID (to avoid 0), addr_bytes, cpu, ram
-                    packed_data = struct.pack(SHARED_MEM_FORMAT, slot_index + 1, addr_bytes, cpu, ram)
-                    shm.buf[offset:offset + PACKED_DATA_SIZE] = packed_data
+                except (pickle.UnpicklingError, EOFError) as e:
+                    print(f"[Collector] Could not decode data from {addr}: {e}")
 
-            except socket.timeout:
-                print(f"[Collector] Client {slot_index+1} at {addr} timed out.")
-                break
-            except (pickle.UnpicklingError, EOFError):
-                print(f"[Collector] Could not decode data from {addr}. Raw: {data}")
+            # 2. Handle Outgoing Commands from Queue
+            try:
+                while True:
+                    cmd = my_queue.get_nowait()
+                    print(f"[Collector] Sending command to Client {slot_index}: {cmd['type']}")
+                    conn.sendall(pickle.dumps(cmd))
+            except queue.Empty:
+                pass
 
     except ConnectionResetError:
         print(f"[Collector] Connection reset by {addr}.")
@@ -96,11 +138,31 @@ def handle_client(conn, addr, shm, lock):
         print(f"[Collector] Client {addr} disconnected.")
         conn.close()
 
+def dispatcher_thread(master_cmd_queue, client_queues):
+    """Reads global commands and routes them to specific client queues."""
+    while True:
+        try:
+            # (slot_id, command_dict)
+            target_slot, cmd = master_cmd_queue.get()
+            if 0 <= target_slot < MAX_CLIENTS:
+                client_queues[target_slot].put(cmd)
+            else:
+                print(f"[Dispatcher] Invalid slot ID: {target_slot}")
+        except Exception as e:
+            print(f"[Dispatcher] Error: {e}")
 
-def collector_process_target(shm_name, lock, host, port):
+def collector_process_target(shm_name, lock, host, port, master_cmd_queue):
     """Listens for agents and writes data to shared memory."""
     print("[Collector] Process started.")
     shm = shared_memory.SharedMemory(name=shm_name)
+
+    # Per-slot queues for thread communication
+    # Since threads are in this process, they can share this list
+    client_queues = [queue.Queue() for _ in range(MAX_CLIENTS)]
+
+    # Start Dispatcher
+    d_thread = threading.Thread(target=dispatcher_thread, args=(master_cmd_queue, client_queues), daemon=True)
+    d_thread.start()
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -112,7 +174,7 @@ def collector_process_target(shm_name, lock, host, port):
             while True:
                 conn, addr = s.accept()
                 # Use threading for better performance with I/O-bound tasks
-                client_thread = threading.Thread(target=handle_client, args=(conn, addr, shm, lock))
+                client_thread = threading.Thread(target=handle_client, args=(conn, addr, shm, lock, client_queues))
                 client_thread.start()
         except Exception as e:
             print(f"[Collector] Critical Error: {e}")
@@ -146,7 +208,7 @@ def dashboard_process_target(shm_name, lock):
                             client_addr = addr_bytes.decode('utf-8').strip('\x00')
                             clients_html += f"""
                             <div class="metric">
-                                <h2>CPU Usage: {cpu:.2f}% (Client {slot_id}: {client_addr})</h2>
+                                <h2>CPU Usage: {cpu:.2f}% (Client {slot_id-1} [Slot {i}]: {client_addr})</h2>
                                 <div class="bar-container">
                                     <div class="bar cpu-bar" style="width: {cpu}%;">{cpu:.2f}%</div>
                                 </div>
@@ -195,6 +257,76 @@ def dashboard_process_target(shm_name, lock):
                 response = f"HTTP/1.1 200 OK\nContent-Type: text/html\nContent-Length: {len(html_content)}\n\n{html_content}"
                 conn.sendall(response.encode('utf-8'))
 
+# --- Input Thread (CLI) ---
+
+def input_thread_target(master_cmd_queue):
+    """Reads stdin and sends commands to the collector."""
+    print("--- Master CLI ---")
+    print("Commands:")
+    print("  exec <slot_id> <script_path>  - Execute a task")
+    print("  stop <slot_id>                - Stop current task")
+    print("  end <slot_id>                 - Terminate agent")
+    print("------------------")
+    
+    while True:
+        try:
+            cmd_str = sys.stdin.readline()
+            if not cmd_str:
+                break
+            cmd_str = cmd_str.strip()
+            if not cmd_str:
+                continue
+
+            parts = cmd_str.split()
+            command = parts[0].lower()
+
+            if command == 'exec':
+                if len(parts) < 3:
+                    print("Usage: exec <slot_id> <script_path>")
+                    continue
+                try:
+                    slot_id = int(parts[1])
+                    script = parts[2]
+                    task_id = str(uuid.uuid4())[:8]
+                    msg = {
+                        'type': 'EXECUTE',
+                        'payload': {'task_id': task_id, 'script': script}
+                    }
+                    master_cmd_queue.put((slot_id, msg))
+                    print(f"Queued EXECUTE for slot {slot_id}")
+                except ValueError:
+                    print("Invalid slot ID.")
+
+            elif command == 'stop':
+                if len(parts) < 2:
+                    print("Usage: stop <slot_id>")
+                    continue
+                try:
+                    slot_id = int(parts[1])
+                    msg = {'type': 'STOP_TASK', 'payload': {}}
+                    master_cmd_queue.put((slot_id, msg))
+                    print(f"Queued STOP_TASK for slot {slot_id}")
+                except ValueError:
+                    print("Invalid slot ID.")
+
+            elif command == 'end':
+                if len(parts) < 2:
+                    print("Usage: end <slot_id>")
+                    continue
+                try:
+                    slot_id = int(parts[1])
+                    msg = {'type': 'END', 'payload': {}}
+                    master_cmd_queue.put((slot_id, msg))
+                    print(f"Queued END for slot {slot_id}")
+                except ValueError:
+                    print("Invalid slot ID.")
+            
+            else:
+                print("Unknown command.")
+
+        except Exception as e:
+            print(f"CLI Error: {e}")
+
 # --- Main Application ---
 
 if __name__ == "__main__":
@@ -207,6 +339,9 @@ if __name__ == "__main__":
 
     shm = None
     shm_created = False
+    
+    master_cmd_queue = multiprocessing.Queue()
+
     try:
         # Clean up old segment first
         try:
@@ -233,11 +368,15 @@ if __name__ == "__main__":
                 shm.buf[offset:offset + PACKED_DATA_SIZE] = initial_data
 
         # Create and start processes
-        collector = multiprocessing.Process(target=collector_process_target, args=(SHARED_MEM_NAME, lock, args.host, args.port))
+        collector = multiprocessing.Process(target=collector_process_target, args=(SHARED_MEM_NAME, lock, args.host, args.port, master_cmd_queue))
         dashboard = multiprocessing.Process(target=dashboard_process_target, args=(SHARED_MEM_NAME, lock))
 
         collector.start()
         dashboard.start()
+
+        # Start CLI thread in Main Process
+        cli_thread = threading.Thread(target=input_thread_target, args=(master_cmd_queue,), daemon=True)
+        cli_thread.start()
 
         # Wait for processes to finish (they won't, in this case, until interrupted)
         collector.join()
