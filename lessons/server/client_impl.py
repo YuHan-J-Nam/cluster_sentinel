@@ -6,7 +6,7 @@ import sys
 sys.path.append("../circArea")
 from higherDimension import doCalculation
 
-HOST, PORT = "0.0.0.0", 14230
+HOST, PORT = "163.180.2.245", 14230
 
 print(f"[Client] Client is connecting to server")
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -29,8 +29,6 @@ try:
 			volumeNDim, nAccept, nTotal = doCalculation()
 			data = struct.pack('f 2i', volumeNDim, nAccept, nTotal)
 			s.sendall(data)
-		elif cmd == b"END":
-			raise "Finishing..."
 		else:
 			raise "Finishing..."
 except:
