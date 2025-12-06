@@ -8,6 +8,7 @@ import time
 import threading
 import queue
 import sys
+import os
 import select
 import uuid
 from multiprocessing import shared_memory, Lock
@@ -57,7 +58,7 @@ def handle_client(conn, addr, shm, lock, client_data, slot_index):
         
         # Track last activity for timeout (heartbeats are every 2s)
         last_active = time.time()
-        CLIENT_TIMEOUT = 10.0 # seconds
+        CLIENT_TIMEOUT = 6.0 # seconds
 
         while True:
             # Calculate dynamic timeout for select
