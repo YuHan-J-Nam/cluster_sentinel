@@ -63,11 +63,14 @@ The Master needs a way to inject commands into the `handle_client` threads.
     *   Parses commands like: `exec <client_id> <script>`, `stop <client_id>`, `end <client_id>`.
     *   Puts commands into a global `command_queues` dictionary: `{client_id: queue.Queue()}`.
 
-2.  **`handle_client` Refactoring:**
-    *   Currently blocks on `conn.recv()`.
-    *   Switch to `select.select([conn], [], [], timeout=0.5)`.
-    *   **On Read (`conn`):** Process `HEARTBEAT` (update shared mem) or `TASK_RESULT` (print/log).
-    *   **On Timeout/Loop:** Check the client's specific `Queue`. If a command exists, pickle and send it to the agent.
+2.  **`handle_client` Refactoring (with Self-Pipe Trick and Dynamic Timeout):**
+    *   Replaced the fixed `select.select` timeout with a **dynamic timeout** based on client activity. If no data (heartbeat) is received for `CLIENT_TIMEOUT` (10 seconds), the connection is considered dead and cleaned up.
+    *   Implemented the **Self-Pipe Trick**:
+        *   Each `handle_client` thread now has its own `os.pipe()`. The read end of this pipe is added to the `select.select()` monitoring list.
+        *   When the Master CLI queues a command for a client, a byte is written to the write end of that client's pipe.
+        *   This immediately wakes up the `handle_client` thread via `select.select()`, allowing it to process the new command from its queue without waiting for the dynamic timeout to expire.
+    *   **On Read (`conn`):** Process `HEARTBEAT` (update shared mem) or `TASK_RESULT` (print/log). Reset `last_active` timestamp.
+    *   **On Read (`pipe_r`):** A command has arrived in the client's specific `Queue`. Read and discard the byte, then process the command.
 
 ## 4. Implementation Steps
 

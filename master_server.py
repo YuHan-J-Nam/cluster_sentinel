@@ -38,43 +38,54 @@ def find_slot(shm):
             return i
     return None
 
-def handle_client(conn, addr, shm, lock, client_queues):
+def handle_client(conn, addr, shm, lock, client_data, slot_index):
     """Handles a single agent connection."""
     print(f"[Collector] Connected by {addr}")
     # Prepare address string for shared memory
     addr_str = str(addr)
     addr_bytes = addr_str.encode('utf-8')
 
-    slot_index = None
+    # Extract client-specific data
+    my_queue = client_data['queue']
+    pipe_r = client_data['pipe_r']
+    pipe_w = client_data['pipe_w'] # pipe_w is technically not used here, but kept for reference
+
     try:
-        with lock:
-            slot_index = find_slot(shm)
-            if slot_index is not None:
-                # IMMEDIATELY reserve the slot so others don't take it
-                # slot_index + 1 = Active ID
-                print(f"[Collector] Reserving slot {slot_index} for {addr}")
-                offset = slot_index * PACKED_DATA_SIZE
-                packed_data = struct.pack(SHARED_MEM_FORMAT, slot_index + 1, addr_bytes, 0.0, 0.0)
-                shm.buf[offset:offset + PACKED_DATA_SIZE] = packed_data
-
-        if slot_index is None:
-            print("[Collector] No available slots for new client.")
-            return
-
+        # The slot is already reserved and assigned in collector_process_target
         print(f"[Collector] Client {addr} assigned to slot {slot_index}")
         offset = slot_index * PACKED_DATA_SIZE
         
-        # Get the queue for this slot
-        my_queue = client_queues[slot_index]
+        # Track last activity for timeout (heartbeats are every 2s)
+        last_active = time.time()
+        CLIENT_TIMEOUT = 10.0 # seconds
 
         while True:
-            # Select loop to handle both socket and queue
-            readable, _, _ = select.select([conn], [], [], 0.1)
+            # Calculate dynamic timeout for select
+            timeout_duration = CLIENT_TIMEOUT - (time.time() - last_active)
+            if timeout_duration < 0:
+                print(f"[Collector] Client {addr} timed out (no data for {CLIENT_TIMEOUT}s).")
+                break
+            
+            inputs = [conn, pipe_r] # Add the pipe read end to select inputs
+
+            # Select loop to handle both socket and pipe
+            readable, _, _ = select.select(inputs, [], [], timeout_duration)
+
+            # Handle pipe readability - means a command was put in the queue
+            if pipe_r in readable:
+                os.read(pipe_r, 1) # Read and discard the byte to clear the pipe
 
             # 1. Handle Incoming Data from Agent
             if conn in readable:
-                data = conn.recv(4096)
+                try:
+                    data = conn.recv(4096)
+                    last_active = time.time() # Reset timeout on any data
+                except ConnectionResetError:
+                    print(f"[Collector] Connection reset by {addr} (recv).")
+                    break
+
                 if not data:
+                    print(f"[Collector] {addr} closed connection (EOF).")
                     break
 
                 try:
@@ -117,7 +128,11 @@ def handle_client(conn, addr, shm, lock, client_queues):
                 while True:
                     cmd = my_queue.get_nowait()
                     print(f"[Collector] Sending command to Client {slot_index}: {cmd['type']}")
-                    conn.sendall(pickle.dumps(cmd))
+                    try:
+                        conn.sendall(pickle.dumps(cmd))
+                    except (BrokenPipeError, ConnectionResetError):
+                        print(f"[Collector] Failed to send command to {addr}: Connection lost.")
+                        raise # Re-raise to trigger exception handler/finally
             except queue.Empty:
                 pass
 
@@ -128,24 +143,38 @@ def handle_client(conn, addr, shm, lock, client_queues):
     finally:
         # Clear the slot on disconnect
         if slot_index is not None:
+            print(f"[Collector] Cleaning up slot {slot_index} for {addr}...")
             with lock:
                 offset = slot_index * PACKED_DATA_SIZE
                 # 0 = Inactive
-                clear_data = struct.pack(SHARED_MEM_FORMAT, 0, b'', 0.0, 0.0)
-                shm.buf[offset:offset + PACKED_DATA_SIZE] = clear_data
-            print(f"[Collector] Cleared slot {slot_index}")
+                try:
+                    clear_data = struct.pack(SHARED_MEM_FORMAT, 0, b'', 0.0, 0.0)
+                    shm.buf[offset:offset + PACKED_DATA_SIZE] = clear_data
+                    print(f"[Collector] SUCCESS: Cleared slot {slot_index} in shared memory.")
+                except Exception as e:
+                    print(f"[Collector] ERROR: Failed to clear slot {slot_index}: {e}")
+        else:
+             print(f"[Collector] Disconnect from {addr} (No slot assigned).")
 
         print(f"[Collector] Client {addr} disconnected.")
         conn.close()
+        
+        # Close the pipe read file descriptor for this client's thread
+        if pipe_r is not None:
+            os.close(pipe_r)
+            print(f"[Collector] Closed pipe_r for slot {slot_index}")
 
-def dispatcher_thread(master_cmd_queue, client_queues):
+def dispatcher_thread(master_cmd_queue, client_queues_data):
     """Reads global commands and routes them to specific client queues."""
     while True:
         try:
             # (slot_id, command_dict)
             target_slot, cmd = master_cmd_queue.get()
             if 0 <= target_slot < MAX_CLIENTS:
-                client_queues[target_slot].put(cmd)
+                # Get the specific client's queue and pipe_w from the data structure
+                client_data = client_queues_data[target_slot]
+                client_data['queue'].put(cmd)
+                os.write(client_data['pipe_w'], b'1') # Wake up the client's handle_client thread
             else:
                 print(f"[Dispatcher] Invalid slot ID: {target_slot}")
         except Exception as e:
@@ -156,12 +185,16 @@ def collector_process_target(shm_name, lock, host, port, master_cmd_queue):
     print("[Collector] Process started.")
     shm = shared_memory.SharedMemory(name=shm_name)
 
-    # Per-slot queues for thread communication
-    # Since threads are in this process, they can share this list
-    client_queues = [queue.Queue() for _ in range(MAX_CLIENTS)]
+    # Each slot now has a queue for commands and a pipe for waking up its handle_client thread
+    client_data_per_slot = []
+    for _ in range(MAX_CLIENTS):
+        q = queue.Queue()
+        r_fd, w_fd = os.pipe() # Create a pipe for self-pipe trick
+        os.set_blocking(r_fd, False) # Make read end non-blocking
+        client_data_per_slot.append({'queue': q, 'pipe_r': r_fd, 'pipe_w': w_fd})
 
-    # Start Dispatcher
-    d_thread = threading.Thread(target=dispatcher_thread, args=(master_cmd_queue, client_queues), daemon=True)
+    # Start Dispatcher, passing the list of client data dictionaries
+    d_thread = threading.Thread(target=dispatcher_thread, args=(master_cmd_queue, client_data_per_slot), daemon=True)
     d_thread.start()
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -173,11 +206,37 @@ def collector_process_target(shm_name, lock, host, port, master_cmd_queue):
 
             while True:
                 conn, addr = s.accept()
-                # Use threading for better performance with I/O-bound tasks
-                client_thread = threading.Thread(target=handle_client, args=(conn, addr, shm, lock, client_queues))
+                
+                slot_idx = None
+                with lock: # Ensure exclusive access when finding and reserving slot
+                    slot_idx = find_slot(shm)
+
+                    if slot_idx is None:
+                        print(f"[Collector] No available slots for new client {addr}. Closing connection.")
+                        conn.close()
+                        continue # Continue listening for new clients
+
+                    # Immediately reserve the slot in shared memory
+                    addr_str = str(addr)
+                    addr_bytes = addr_str.encode('utf-8')
+                    offset = slot_idx * PACKED_DATA_SIZE
+                    packed_data = struct.pack(SHARED_MEM_FORMAT, slot_idx + 1, addr_bytes, 0.0, 0.0)
+                    shm.buf[offset:offset + PACKED_DATA_SIZE] = packed_data
+                    print(f"[Collector] Reserving slot {slot_idx} for {addr}")
+
+                # Pass the specific client_data dictionary AND the assigned slot_idx
+                client_thread = threading.Thread(target=handle_client, 
+                                                args=(conn, addr, shm, lock, client_data_per_slot[slot_idx], slot_idx))
                 client_thread.start()
+
         except Exception as e:
             print(f"[Collector] Critical Error: {e}")
+        finally:
+            # Close all pipe write FDs when the collector process exits
+            for client_data in client_data_per_slot:
+                os.close(client_data['pipe_w'])
+            # handle_client threads are responsible for closing their pipe_r
+
 
 
 # --- Dashboard Process ---
