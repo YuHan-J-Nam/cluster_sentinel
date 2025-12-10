@@ -127,4 +127,31 @@ This document details the step-by-step development of "The Cluster Sentinel", a 
 - **Implementation:** Updated `port_forward.py` to include a `--host` argument.
 - **Reasoning:** Previously hardcoded to `0.0.0.0`, explicitly allowing the bind address to be configured provides greater flexibility for testing on different network interfaces (e.g., binding only to a specific VPN IP or localhost for secure testing).
 
+## Phase 8: Bi-Directional Command & Distributed Tasks
 
+**Goal:** Transform the system from a passive monitor into an active "Command & Control" cluster capable of executing distributed tasks (like password cracking).
+
+### Step 8.1: Master Server Command Architecture
+- **Problem:** The Master needed to inject commands into specific client handling threads without blocking the main listener or other clients.
+- **Solution:** Implemented a **Queue + Self-Pipe** pattern.
+    - **Queues:** Each connected client (Slot) has a `multiprocessing.Queue`. The CLI thread puts commands into these queues.
+    - **Self-Pipe:** To wake up the `handle_client` thread instantly when a command arrives (avoiding polling), the CLI thread writes a byte to a pipe. The client thread monitors this pipe using `select()`.
+- **Result:** Commands are dispatched instantly with zero CPU waste from busy-waiting.
+
+### Step 8.2: The Non-Blocking Agent
+- **Problem:** The original `agent.py` slept for 2 seconds (`time.sleep(2)`), making it deaf to incoming commands during that window.
+- **Solution:** Refactored the main loop to use `select.select()`.
+    - It now monitors the socket for incoming commands *and* checks the clock for when to send heartbeats.
+    - Added `TaskManager` class to spawn tasks using `subprocess.Popen` with non-blocking pipes, allowing task output to be streamed back to the master in real-time.
+
+### Step 8.3: Secure Task Execution (Whitelist)
+- **Security Concern:** Sending arbitrary shell commands or file paths (e.g., `exec 0 /bin/rm -rf /`) is a major security risk.
+- **Solution:** Implemented a **Task Registry**.
+    - The Agent has a hardcoded dictionary: `TASK_REGISTRY = {"crack": "tasks/cracker_task.py", ...}`.
+    - The Master sends a *Task Name* (e.g., "crack"), not a path. The Agent looks it up. If it's not in the registry, it's rejected.
+    - Arguments are passed securely via `subprocess.Popen` (avoiding `shell=True`), preventing injection attacks.
+
+### Step 8.4: Distributed Hash Cracking
+- **Implementation:** Created `tasks/cracker_task.py`, a CPU-intensive script that brute-forces SHA-256 hashes.
+- **Integration:** Updated `agent.py` and `master_server.py` to support passing arguments (e.g., `exec 0 crack <hash> a m`).
+- **Outcome:** The cluster can now effectively split a massive search space across multiple nodes, demonstrating true distributed computing.

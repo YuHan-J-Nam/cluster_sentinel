@@ -7,19 +7,36 @@ import sys
 import subprocess
 import os
 
+# --- Security Configuration ---
+TASK_REGISTRY = {
+    "crack": "tasks/cracker_task.py",
+    "dummy": "tasks/dummy_task.py"
+}
+# ------------------------------
+
 class TaskManager:
     def __init__(self):
         self.process = None
         self.task_id = None
 
-    def start_task(self, task_id, script_path):
+    def start_task(self, task_id, task_name, args):
         if self.process and self.process.poll() is None:
             return False, "Task already running"
 
+        script_path = TASK_REGISTRY.get(task_name)
+        if not script_path:
+            return False, f"Unauthorized task: {task_name}"
+        
+        if not os.path.exists(script_path):
+             return False, f"Script not found: {script_path}"
+
         try:
-            # Run with -u for unbuffered output to capture prints immediately
+            # Run with -u for unbuffered output
+            # args is a list of strings, e.g., ["hash", "a", "m"]
+            cmd = [sys.executable, '-u', script_path] + args
+            
             self.process = subprocess.Popen(
-                [sys.executable, '-u', script_path], 
+                cmd, 
                 stdout=subprocess.PIPE, 
                 stderr=subprocess.PIPE,
                 text=True
@@ -28,7 +45,7 @@ class TaskManager:
             # Set non-blocking
             os.set_blocking(self.process.stdout.fileno(), False)
             os.set_blocking(self.process.stderr.fileno(), False)
-            return True, "Task started"
+            return True, f"Task '{task_name}' started"
         except Exception as e:
             return False, str(e)
 

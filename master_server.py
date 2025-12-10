@@ -342,18 +342,21 @@ def input_thread_target(master_cmd_queue):
 
             if command == 'exec':
                 if len(parts) < 3:
-                    print("Usage: exec <slot_id> <script_path>")
+                    print("Usage: exec <slot_id> <task_name> [args...]")
                     continue
                 try:
                     slot_id = int(parts[1])
-                    script = parts[2]
+                    task_name = parts[2]
+                    # Capture any additional arguments
+                    task_args = parts[3:] if len(parts) > 3 else []
+                    
                     task_id = str(uuid.uuid4())[:8]
                     msg = {
                         'type': 'EXECUTE',
-                        'payload': {'task_id': task_id, 'script': script}
+                        'payload': {'task_id': task_id, 'task_name': task_name, 'args': task_args}
                     }
                     master_cmd_queue.put((slot_id, msg))
-                    print(f"Queued EXECUTE for slot {slot_id}")
+                    print(f"Queued EXECUTE '{task_name}' for slot {slot_id} with args: {task_args}")
                 except ValueError:
                     print("Invalid slot ID.")
 
