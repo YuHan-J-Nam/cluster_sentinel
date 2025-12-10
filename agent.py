@@ -122,9 +122,11 @@ def main():
                             
                             if msg_type == 'EXECUTE':
                                 tid = message['payload']['task_id']
-                                script = message['payload']['script']
-                                print(f"Received EXECUTE command: {script} (ID: {tid})")
-                                success, msg = task_manager.start_task(tid, script)
+                                task_name = message['payload']['task_name']
+                                args = message['payload'].get('args', [])
+                                
+                                print(f"Received EXECUTE command: {task_name} {args} (ID: {tid})")
+                                success, msg = task_manager.start_task(tid, task_name, args)
                                 s.sendall(pickle.dumps({
                                     'type': 'TASK_STATUS',
                                     'payload': {'task_id': tid, 'status': 'STARTED' if success else 'FAILED', 'info': msg}
